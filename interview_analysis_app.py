@@ -1871,6 +1871,87 @@ def export_report_file():
     return tmp.name
 
 
+def collect_interview_summary(transcript: str, label: str) -> dict | None:
+    """对单份访谈做轻量分析，返回可供跨访谈对比的摘要字典。"""
+    if not transcript or not transcript.strip():
+        return None
+    segments = preprocess_transcript(transcript)
+    if not segments:
+        return None
+    all_codes = code_themes(segments)
+    themes = list({c["theme"] for codes in all_codes.values() for c in codes})
+    sentiments = analyze_sentiment(segments)
+    overall_counts: dict[str, int] = {}
+    for s in sentiments:
+        key = s.get("overall", "未知")
+        overall_counts[key] = overall_counts.get(key, 0) + 1
+    dominant = max(overall_counts, key=overall_counts.get) if overall_counts else "未知"
+    return {"label": label, "themes": themes, "sentiment_summary": dominant, "segments_count": len(segments)}
+
+
+def synthesize_multi_interview_data(per_interview: list[dict]) -> str:
+    """将多份访谈的摘要列表格式化为供 LLM 综合分析的文本。"""
+    lines = []
+    for item in per_interview:
+        lines.append(
+            f"【{item['label']}】片段数：{item.get('segments_count', '?')}，整体情感：{item['sentiment_summary']}"
+        )
+        lines.append(f"  主题标签：{', '.join(item['themes']) if item['themes'] else '无'}")
+    return "\n".join(lines)
+
+
+def run_multi_analysis(t1: str, t2: str, t3: str, research_question: str = "", progress=gr.Progress()):
+    """对最多3份访谈并行分析，最后综合输出跨访谈洞察。"""
+    inputs = [(t1, "受访者1"), (t2, "受访者2"), (t3, "受访者3")]
+    active = [(t, label) for t, label in inputs if t and t.strip()]
+    if not active:
+        raise gr.Error("请至少输入一份访谈文本。")
+
+    progress(0.05, desc=f"开始并行分析 {len(active)} 份访谈")
+
+    with ThreadPoolExecutor(max_workers=len(active)) as executor:
+        futures = {executor.submit(collect_interview_summary, t, label): label for t, label in active}
+        results = []
+        for future in as_completed(futures):
+            summary = future.result()
+            if summary:
+                results.append(summary)
+
+    if not results:
+        raise gr.Error("所有访谈文本均未能解析，请检查格式。")
+
+    progress(0.75, desc="综合跨访谈洞察")
+    data_text = synthesize_multi_interview_data(results)
+    research_ctx = build_research_context(research_question)
+    system = "你是腾讯用户研究团队的高级研究员，正在对多份用户访谈进行横向对比分析。"
+    user_prompt = f"""以下是对多位受访者的访谈分析摘要：{research_ctx}
+
+{data_text}
+
+请输出跨访谈综合洞察报告（Markdown）：
+
+### 共性发现
+（所有或多数受访者都提到的核心主题，频率≥2次的优先列出）
+
+### 差异点
+（不同受访者之间存在明显分歧的地方）
+
+### 高优先级用户需求
+（综合多方观点，按重要性排序）
+
+### 建议后续跟进的问题
+每条发现都要注明来自哪几位受访者。"""
+    synthesis = call_llm(system, user_prompt)
+
+    progress(1.0, desc="多访谈综合分析完成")
+    summary_lines = [f"**共分析 {len(results)} 份访谈**\n"]
+    for r in results:
+        summary_lines.append(
+            f"- {r['label']}：{r['segments_count']} 个片段，整体情感={r['sentiment_summary']}，主题 {len(r['themes'])} 个"
+        )
+    return "\n".join(summary_lines), synthesis
+
+
 def build_default_outputs():
     return (
         build_summary_placeholder(),
@@ -2007,6 +2088,31 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
             """
         )
 
+        # ===== 多访谈对比区 =====
+        with gr.Group(elem_classes="panel-card"):
+            gr.HTML(
+                render_section_header(
+                    "多访谈横向对比",
+                    "最多输入 3 份访谈文本，AI 并行分析后提炼共性与差异，生成跨访谈综合洞察。",
+                    kicker="进阶功能",
+                )
+            )
+            with gr.Row():
+                multi_rq_input = gr.Textbox(
+                    label="研究目标（可选）",
+                    placeholder="例：用户对新版功能的核心诉求是什么？",
+                    lines=2,
+                    scale=4,
+                )
+                multi_analyze_btn = gr.Button("开始多访谈对比", variant="primary", scale=1, min_width=140)
+            with gr.Row():
+                multi_t1 = gr.Textbox(label="访谈 1", placeholder="粘贴第一份访谈文本...", lines=10)
+                multi_t2 = gr.Textbox(label="访谈 2（可选）", placeholder="粘贴第二份访谈文本...", lines=10)
+                multi_t3 = gr.Textbox(label="访谈 3（可选）", placeholder="粘贴第三份访谈文本...", lines=10)
+            with gr.Row():
+                multi_summary_output = gr.Markdown(label="访谈概览", value="*等待分析...*")
+            multi_synthesis_output = gr.Markdown(label="跨访谈综合洞察", value="*等待分析...*")
+
     # ===== 事件绑定 =====
     demo_btn.click(
         fn=load_demo_data,
@@ -2027,6 +2133,11 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
     ).then(
         fn=lambda: gr.File(visible=True),
         outputs=export_file,
+    )
+    multi_analyze_btn.click(
+        fn=run_multi_analysis,
+        inputs=[multi_t1, multi_t2, multi_t3, multi_rq_input],
+        outputs=[multi_summary_output, multi_synthesis_output],
     )
 
 
