@@ -230,6 +230,13 @@ def build_summary_html(
 # ========== 分析模块 ==========
 
 _QA_PATTERN = re.compile(r'(Q\d+)[：:](.+?)\n\s*(?:P\d+|受访者)[：:](.+?)(?=\nQ\d+[：:]|\Z)', re.DOTALL)
+
+
+def build_research_context(research_question: str) -> str:
+    """将研究目标格式化为 prompt 前缀，空时返回空字符串。"""
+    if not research_question or not research_question.strip():
+        return ""
+    return f"\n\n【本次研究目标】\n{research_question.strip()}\n请在分析时优先关注与上述目标相关的信息。\n"
 _JSON_FENCE_PATTERN = re.compile(r'```(?:json)?\s*([\s\S]*?)```', re.DOTALL)
 
 
@@ -277,8 +284,9 @@ def preprocess_transcript(raw_text: str) -> list[dict]:
     return [{"id": qid, "question": q.strip(), "answer": a.strip()} for qid, q, a in matches]
 
 
-def code_themes(segments: list[dict], progress=None) -> dict:
-    system = """你是一位专业的用户研究员，擅长对用户访谈文本进行主题编码。
+def code_themes(segments: list[dict], research_question: str = "", progress=None) -> dict:
+    research_ctx = build_research_context(research_question)
+    system = f"""你是一位专业的用户研究员，擅长对用户访谈文本进行主题编码。{research_ctx}
 请严格按照以下规则进行编码：
 1. 每段回答可能包含多个主题，请逐一提取
 2. 每个主题必须配对原文引述（直接引用受访者原话）
@@ -319,8 +327,9 @@ def code_themes(segments: list[dict], progress=None) -> dict:
     return ordered
 
 
-def analyze_sentiment(segments: list[dict]) -> list[dict]:
-    system = """你是用户研究情感分析专家。
+def analyze_sentiment(segments: list[dict], research_question: str = "") -> list[dict]:
+    research_ctx = build_research_context(research_question)
+    system = f"""你是用户研究情感分析专家。{research_ctx}
 请对每段用户回答进行情感标注。
 注意区分"对产品功能的情感"和"对体验问题的情感"，同一段回答中可能包含多种情感。"""
 
@@ -368,14 +377,14 @@ def cluster_themes(all_codes: dict) -> dict:
     return safe_parse_json_object(result)
 
 
-def generate_insights(affinity: dict, sentiments: list) -> str:
+def generate_insights(affinity: dict, sentiments: list, research_question: str = "") -> str:
+    research_ctx = build_research_context(research_question)
     context = json.dumps({
         "affinity_clusters": affinity,
         "sentiment_analysis": sentiments
     }, ensure_ascii=False, indent=2)
 
-    user_prompt = f"""基于以下访谈分析结果，请生成研究洞察报告。
-
+    user_prompt = f"""基于以下访谈分析结果，请生成研究洞察报告。{research_ctx}
 分析数据：
 {context}
 
@@ -540,9 +549,10 @@ def format_affinity_html(affinity: dict) -> str:
 
 # ========== 主分析流程 ==========
 
-def run_analysis(transcript: str, model_choice: str, progress=gr.Progress()):
+def run_analysis(transcript: str, model_choice: str, research_question: str = "", progress=gr.Progress()):
     """一键执行完整分析流程"""
-    global MODEL
+    global MODEL, _last_report_data
+    _last_report_data = {}
 
     if not transcript.strip():
         raise gr.Error("请输入访谈文本！")
@@ -587,7 +597,7 @@ def run_analysis(transcript: str, model_choice: str, progress=gr.Progress()):
 
     # Step 2: 主题编码
     progress(0.1, desc="开始主题编码")
-    all_codes = code_themes(segments, progress=progress)
+    all_codes = code_themes(segments, research_question=research_question, progress=progress)
 
     codes_html = format_codes_html(all_codes)
     total_themes = sum(len(v) for v in all_codes.values())
@@ -620,7 +630,7 @@ def run_analysis(transcript: str, model_choice: str, progress=gr.Progress()):
     # Step 3 + 4: 情感分析与主题聚类并行执行（互不依赖）
     progress(0.45, desc="情感分析与主题聚类并行执行中")
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_sentiment = executor.submit(analyze_sentiment, segments)
+        future_sentiment = executor.submit(analyze_sentiment, segments, research_question)
         future_affinity = executor.submit(cluster_themes, all_codes)
         sentiments = future_sentiment.result()
         affinity = future_affinity.result()
@@ -648,7 +658,7 @@ def run_analysis(transcript: str, model_choice: str, progress=gr.Progress()):
 
     # Step 5: 洞察生成
     progress(0.8, desc="生成关键洞察")
-    insights = generate_insights(affinity, sentiments)
+    insights = generate_insights(affinity, sentiments, research_question)
 
     progress(0.95, desc="洞察整理完成")
     summary = build_summary_html(
@@ -1866,6 +1876,20 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
                 with gr.Group(elem_classes="panel-card"):
                     gr.HTML(
                         render_section_header(
+                            "研究目标（可选）",
+                            "输入本次研究的核心问题或假设，AI 分析时会优先关注相关信息。留空则进行通用分析。",
+                        )
+                    )
+                    research_question_input = gr.Textbox(
+                        label="研究问题 / 研究假设",
+                        placeholder="例：用户为何在付款环节流失？/ 用户对新版消息通知功能的感知如何？",
+                        lines=2,
+                        max_lines=4,
+                    )
+
+                with gr.Group(elem_classes="panel-card"):
+                    gr.HTML(
+                        render_section_header(
                             "访谈文本",
                             "支持标准 Q&A 格式，也支持自由段落格式。建议保留受访者原话，方便后续追溯证据。",
                         )
@@ -1873,7 +1897,7 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
                     transcript_input = gr.Textbox(
                         label="访谈文本",
                         placeholder="粘贴访谈转录文本...\n\n支持格式：\nQ1：问题\nP01：回答\n\n也支持自由段落格式",
-                        lines=18,
+                        lines=16,
                         max_lines=50,
                     )
                     with gr.Row(elem_classes="action-row"):
@@ -1929,7 +1953,7 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
     )
     analyze_btn.click(
         fn=run_analysis,
-        inputs=[transcript_input, model_choice],
+        inputs=[transcript_input, model_choice, research_question_input],
         outputs=[summary_output, codes_output, sentiment_output, affinity_output, insights_output],
     )
 
