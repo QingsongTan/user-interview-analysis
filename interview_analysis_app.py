@@ -38,6 +38,12 @@ def get_backend_client() -> OpenAI:
     return client
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(Exception),
+    reraise=True,
+)
 def call_llm(system_prompt: str, user_prompt: str) -> str:
     response = get_backend_client().chat.completions.create(
         model=MODEL,
@@ -224,8 +230,41 @@ def build_summary_html(
 # ========== 分析模块 ==========
 
 _QA_PATTERN = re.compile(r'(Q\d+)[：:](.+?)\n\s*(?:P\d+|受访者)[：:](.+?)(?=\nQ\d+[：:]|\Z)', re.DOTALL)
-_JSON_ARRAY_PATTERN = re.compile(r'\[.*\]', re.DOTALL)
-_JSON_OBJECT_PATTERN = re.compile(r'\{.*\}', re.DOTALL)
+_JSON_FENCE_PATTERN = re.compile(r'```(?:json)?\s*([\s\S]*?)```', re.DOTALL)
+
+
+def safe_parse_json_array(text: str) -> list:
+    """从 LLM 输出中安全提取 JSON 数组，处理 markdown 围栏和格式噪声。"""
+    fence_match = _JSON_FENCE_PATTERN.search(text)
+    candidates = [fence_match.group(1).strip()] if fence_match else []
+    raw_match = re.search(r'\[.*\]', text, re.DOTALL)
+    if raw_match:
+        candidates.append(raw_match.group())
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def safe_parse_json_object(text: str) -> dict:
+    """从 LLM 输出中安全提取 JSON 对象，处理 markdown 围栏和格式噪声。"""
+    fence_match = _JSON_FENCE_PATTERN.search(text)
+    candidates = [fence_match.group(1).strip()] if fence_match else []
+    raw_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if raw_match:
+        candidates.append(raw_match.group())
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 def preprocess_transcript(raw_text: str) -> list[dict]:
@@ -259,8 +298,7 @@ def code_themes(segments: list[dict], progress=None) -> dict:
 
 仅输出JSON，不要其他文字。"""
         result = call_llm(system, user_prompt)
-        json_match = _JSON_ARRAY_PATTERN.search(result)
-        return seg['id'], json.loads(json_match.group()) if json_match else []
+        return seg['id'], safe_parse_json_array(result)
 
     all_codes = {}
     completed = 0
@@ -298,8 +336,7 @@ def analyze_sentiment(segments: list[dict]) -> list[dict]:
 
 仅输出JSON。"""
     result = call_llm(system, user_prompt)
-    json_match = _JSON_ARRAY_PATTERN.search(result)
-    return json.loads(json_match.group()) if json_match else []
+    return safe_parse_json_array(result)
 
 
 def cluster_themes(all_codes: dict) -> dict:
@@ -328,8 +365,7 @@ def cluster_themes(all_codes: dict) -> dict:
 分组数量控制在3-6个，仅输出JSON。"""
     system = "你是用户研究分析专家，擅长使用亲和图法（Affinity Diagram）对定性数据进行归纳分组。"
     result = call_llm(system, user_prompt)
-    json_match = _JSON_OBJECT_PATTERN.search(result)
-    return json.loads(json_match.group()) if json_match else {}
+    return safe_parse_json_object(result)
 
 
 def generate_insights(affinity: dict, sentiments: list) -> str:
