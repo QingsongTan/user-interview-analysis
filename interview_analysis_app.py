@@ -670,6 +670,13 @@ def run_analysis(transcript: str, model_choice: str, research_question: str = ""
         stage_label="分析完成",
     )
 
+    _last_report_data.update({
+        "all_codes": all_codes,
+        "sentiments": sentiments,
+        "affinity": affinity,
+        "insights": insights,
+        "research_question": research_question,
+    })
     progress(1.0, desc="分析完成")
     yield summary, codes_html, sentiment_html, affinity_html, insights
 
@@ -1808,6 +1815,62 @@ footer {
 }
 """
 
+def build_export_report(
+    all_codes: dict,
+    sentiments: list,
+    affinity: dict,
+    insights: str,
+    research_question: str = "",
+) -> str:
+    from datetime import datetime
+    lines = ["# 用户访谈分析报告", "", f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}", ""]
+    if research_question and research_question.strip():
+        lines += ["## 研究目标", "", research_question.strip(), ""]
+    lines += ["## 主题编码", ""]
+    for qid, codes in all_codes.items():
+        lines.append(f"### {qid}")
+        for c in codes:
+            lines.append(f"- **{c.get('theme', '')}**：「{c.get('quote', '')}」—— {c.get('note', '')}")
+        lines.append("")
+    lines += ["## 情感分析", ""]
+    for s in sentiments:
+        lines.append(f"### {s.get('id', '?')}（整体：{s.get('overall', '')}）")
+        for d in s.get("details", []):
+            lines.append(
+                f"- {d.get('aspect', '')}｜{d.get('sentiment', '')}｜强度 {d.get('intensity', '')}｜「{d.get('evidence', '')}」"
+            )
+        lines.append("")
+    lines += ["## 亲和图聚类", ""]
+    for idx, cluster in enumerate(affinity.get("clusters", []), 1):
+        lines.append(f"### 分组 {idx:02d}：{cluster.get('group_name', '')}")
+        lines.append(cluster.get("description", ""))
+        lines.append(f"- 包含主题：{', '.join(cluster.get('themes', []))}")
+        lines.append(f"- 代表引述：「{cluster.get('representative_quote', '')}」")
+        lines.append("")
+    lines += ["## 关键洞察", "", insights or "（尚未生成）", ""]
+    return "\n".join(lines)
+
+
+def export_report_file():
+    import tempfile
+    if not _last_report_data:
+        raise gr.Error("请先完成一次分析，再导出报告。")
+    content = build_export_report(
+        all_codes=_last_report_data.get("all_codes", {}),
+        sentiments=_last_report_data.get("sentiments", []),
+        affinity=_last_report_data.get("affinity", {}),
+        insights=_last_report_data.get("insights", ""),
+        research_question=_last_report_data.get("research_question", ""),
+    )
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".md", prefix="interview_report_",
+        encoding="utf-8", delete=False
+    )
+    tmp.write(content)
+    tmp.close()
+    return tmp.name
+
+
 def build_default_outputs():
     return (
         build_summary_placeholder(),
@@ -1904,6 +1967,8 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
                         demo_btn = gr.Button("加载示例", variant="secondary")
                         clear_btn = gr.Button("清空内容", variant="secondary")
                         analyze_btn = gr.Button("开始分析", variant="primary", scale=2)
+                        export_btn = gr.Button("导出报告", variant="secondary")
+                    export_file = gr.File(label="下载报告", visible=False)
 
             # ===== 右侧：结果区 =====
             with gr.Column(scale=7):
@@ -1955,6 +2020,13 @@ with gr.Blocks(title="用户访谈分析工作台") as app:
         fn=run_analysis,
         inputs=[transcript_input, model_choice, research_question_input],
         outputs=[summary_output, codes_output, sentiment_output, affinity_output, insights_output],
+    )
+    export_btn.click(
+        fn=export_report_file,
+        outputs=export_file,
+    ).then(
+        fn=lambda: gr.File(visible=True),
+        outputs=export_file,
     )
 
 
